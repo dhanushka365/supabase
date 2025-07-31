@@ -208,7 +208,7 @@ services:
 
   # Edge Functions
   functions:
-    image: supabase/edge-runtime:v1.32.3
+    image: supabase/edge-runtime:v1.68.3
     restart: unless-stopped
     depends_on:
       analytics:
