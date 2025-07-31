@@ -1,0 +1,547 @@
+name: Supabase Infrastructure CI/CD Pipeline - GCP Deployment
+
+on:
+  push:
+    branches:
+      - infra-supabase
+  pull_request:
+    branches:
+      - infra-supabase
+
+env:
+  # Using Artifact Registry for container images
+  GCP_REGISTRY: us-central1-docker.pkg.dev
+  GCP_REPOSITORY: supabase-images
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  SUPABASE_VERSION: latest
+
+jobs:
+  validate-and-prepare:
+    runs-on: self-hosted
+    outputs:
+      deployment-needed: ${{ steps.check-changes.outputs.deployment-needed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check for infrastructure changes
+        id: check-changes
+        run: |
+          # Check if any Supabase-related files have changed
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files: $CHANGED_FILES"
+          
+          if echo "$CHANGED_FILES" | grep -E "(docker-compose\.yml|Dockerfile|supabase/|\.env|config\.toml)"; then
+            echo "deployment-needed=true" >> $GITHUB_OUTPUT
+            echo "Infrastructure changes detected - deployment needed"
+          else
+            echo "deployment-needed=false" >> $GITHUB_OUTPUT
+            echo "No infrastructure changes - skipping deployment"
+          fi
+
+      - name: Validate Supabase configuration
+        run: |
+          echo "Validating Supabase configuration files..."
+          
+          # Check if required files exist
+          required_files=("docker-compose.yml" ".env" "supabase/config.toml")
+          for file in "${required_files[@]}"; do
+            if [[ ! -f "$file" ]]; then
+              echo "Error: Required file $file not found"
+              exit 1
+            fi
+            echo "✓ Found $file"
+          done
+          
+          # Validate docker-compose.yml
+          python3 -c "
+          import yaml
+          try:
+              with open('docker-compose.yml', 'r') as f:
+                  data = yaml.safe_load(f)
+              required_services = ['db', 'auth', 'rest', 'realtime', 'storage', 'kong', 'analytics', 'functions']
+              services = data.get('services', {})
+              missing_services = [svc for svc in required_services if svc not in services]
+              if missing_services:
+                  print(f'Missing required services: {missing_services}')
+                  exit(1)
+              print('✓ Docker compose validation passed')
+          except Exception as e:
+              print(f'Docker compose validation failed: {e}')
+              exit(1)
+          "
+          
+          # Validate environment file structure
+          if ! grep -q "POSTGRES_PASSWORD" .env; then
+            echo "Error: .env file missing POSTGRES_PASSWORD"
+            exit 1
+          fi
+          echo "✓ Environment file validation passed"
+
+      - name: Upload configuration artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-config
+          path: |
+            docker-compose.yml
+            .env
+            supabase/
+            Dockerfile
+
+  build-supabase-images:
+    runs-on: self-hosted
+    needs: validate-and-prepare
+    if: github.ref == 'refs/heads/infra-supabase' && needs.validate-and-prepare.outputs.deployment-needed == 'true'
+    strategy:
+      matrix:
+        component: [supabase-all-in-one]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Create Artifact Registry repository
+        run: |
+          echo "Creating Artifact Registry repository if it doesn't exist..."
+          gcloud artifacts repositories create ${{ env.GCP_REPOSITORY }} \
+            --repository-format=docker \
+            --location=us-central1 \
+            --description="Supabase self-hosted container images" \
+            --project=${{ secrets.GCP_PROJECT_ID }} \
+            --quiet || echo "Repository already exists or creation failed (continuing anyway)"
+
+      - name: Enhanced Docker Authentication for Artifact Registry
+        run: |
+          echo "Setting up enhanced Docker authentication..."
+          
+          # Clear existing Docker credentials
+          rm -f ~/.docker/config.json
+          
+          # Confirm identity
+          echo "Current authenticated account:"
+          gcloud auth list --filter=status:ACTIVE --format="value(account)"
+          echo "Current project: $(gcloud config get-value project)"
+          
+          # Authenticate Docker for Artifact Registry
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          
+          echo "Docker authentication completed"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push Supabase Docker image
+        run: |
+          IMAGE_NAME="${{ env.GCP_REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.GCP_REPOSITORY }}/supabase-stack"
+          IMAGE_TAG="${{ github.sha }}"
+          
+          echo "Building Supabase stack image: ${IMAGE_NAME}:${IMAGE_TAG}"
+          
+          # Create a comprehensive Dockerfile for all Supabase services
+          cat > Dockerfile.supabase << 'EOF'
+          FROM ubuntu:22.04
+          
+          # Install dependencies
+          RUN apt-get update && apt-get install -y \
+              curl \
+              wget \
+              git \
+              nodejs \
+              npm \
+              python3 \
+              python3-pip \
+              postgresql-client \
+              docker.io \
+              docker-compose \
+              && rm -rf /var/lib/apt/lists/*
+          
+          # Install Supabase CLI
+          RUN npm install -g supabase@latest
+          
+          # Set working directory
+          WORKDIR /app
+          
+          # Copy all configuration files
+          COPY . .
+          
+          # Make sure volumes directory exists
+          RUN mkdir -p volumes/db/data volumes/storage volumes/functions volumes/logs
+          
+          # Expose all Supabase ports
+          EXPOSE 3000 4000 5000 5001 8000 8080 9999 54321 54322 54323 54324 54325 54326
+          
+          # Default command
+          CMD ["docker-compose", "up", "-d"]
+          EOF
+          
+          # Build the Docker image
+          docker build \
+            -f Dockerfile.supabase \
+            -t ${IMAGE_NAME}:${IMAGE_TAG} \
+            -t ${IMAGE_NAME}:latest \
+            .
+          
+          echo "Build completed successfully"
+          echo "Pushing images to Artifact Registry..."
+          
+          # Push with retry logic
+          push_with_retry() {
+            local image=$1
+            local max_attempts=3
+            local delay=10
+            
+            for attempt in $(seq 1 $max_attempts); do
+              echo "Push attempt $attempt for $image"
+              if docker push $image; then
+                echo "Successfully pushed $image"
+                return 0
+              else
+                echo "Failed to push $image (attempt $attempt/$max_attempts)"
+                if [ $attempt -lt $max_attempts ]; then
+                  echo "Retrying in ${delay} seconds..."
+                  sleep $delay
+                  delay=$((delay * 2))
+                  
+                  # Re-authenticate before retry
+                  ACCESS_TOKEN=$(gcloud auth print-access-token)
+                  echo $ACCESS_TOKEN | docker login -u oauth2accesstoken --password-stdin us-central1-docker.pkg.dev
+                  gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+                fi
+              fi
+            done
+            
+            echo "Failed to push $image after $max_attempts attempts"
+            return 1
+          }
+          
+          # Push images
+          if ! push_with_retry ${IMAGE_NAME}:${IMAGE_TAG}; then
+            echo "Failed to push tagged image after retries"
+            exit 1
+          fi
+          
+          if ! push_with_retry ${IMAGE_NAME}:latest; then
+            echo "Failed to push latest image after retries"
+            exit 1
+          fi
+          
+          echo "Push completed successfully"
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=${IMAGE_TAG}" >> $GITHUB_ENV
+
+      - name: Save image details
+        run: |
+          echo "supabase-stack:${{ env.GCP_REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.GCP_REPOSITORY }}/supabase-stack:${{ github.sha }}" >> image-tags.txt
+
+      - name: Upload image tags
+        uses: actions/upload-artifact@v4
+        with:
+          name: supabase-image-tags
+          path: image-tags.txt
+
+  deploy-supabase-to-gcp:
+    runs-on: self-hosted
+    needs: [build-supabase-images, validate-and-prepare]
+    if: github.ref == 'refs/heads/infra-supabase' && vars.DEPLOY_TO_GCP == 'true' && needs.validate-and-prepare.outputs.deployment-needed == 'true'
+    environment:
+      name: gcp-supabase-production
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download image tags
+        uses: actions/download-artifact@v4
+        with:
+          name: supabase-image-tags
+          path: artifacts/
+
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          service_account_key: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Get VM External IP
+        id: get-ip
+        run: |
+          EXTERNAL_IP=$(gcloud compute instances describe ${{ secrets.GCP_VM_INSTANCE_NAME }} \
+            --zone=${{ secrets.GCP_VM_ZONE }} \
+            --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
+          echo "EXTERNAL_IP=${EXTERNAL_IP}" >> $GITHUB_OUTPUT
+          echo "VM External IP: ${EXTERNAL_IP}"
+
+      - name: Prepare Supabase deployment files
+        run: |
+          # Create deployment directory
+          mkdir -p deployment/supabase/volumes/{db,storage,functions,logs}
+          
+          # Copy all necessary files
+          cp docker-compose.yml deployment/
+          cp .env deployment/
+          cp -r supabase/ deployment/
+          
+          # Update environment variables for production
+          sed -i "s|API_EXTERNAL_URL=.*|API_EXTERNAL_URL=http://${{ steps.get-ip.outputs.EXTERNAL_IP }}:8000|g" deployment/.env
+          sed -i "s|SUPABASE_PUBLIC_URL=.*|SUPABASE_PUBLIC_URL=http://${{ steps.get-ip.outputs.EXTERNAL_IP }}:8000|g" deployment/.env
+          sed -i "s|SITE_URL=.*|SITE_URL=http://${{ steps.get-ip.outputs.EXTERNAL_IP }}:3000|g" deployment/.env
+          
+          # Create enhanced deployment script
+          cat > deployment/deploy-supabase.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          echo "Starting Supabase deployment..."
+          
+          # Ensure Docker is running
+          sudo systemctl start docker
+          sudo systemctl enable docker
+          
+          # Add current user to docker group if not already
+          sudo usermod -aG docker $USER || true
+          
+          # Configure Docker for Artifact Registry
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          
+          # Stop any existing Supabase services
+          docker-compose -f docker-compose.yml down --volumes --remove-orphans || true
+          
+          # Clean up old containers and images
+          docker system prune -f
+          
+          # Create required directories with proper permissions
+          sudo mkdir -p volumes/db/data volumes/storage volumes/functions volumes/logs
+          sudo chown -R $USER:$USER volumes/
+          
+          # Pull latest images
+          echo "Pulling Supabase images..."
+          docker-compose -f docker-compose.yml pull
+          
+          # Start Supabase services
+          echo "Starting Supabase services..."
+          docker-compose -f docker-compose.yml up -d
+          
+          # Wait for services to be ready
+          echo "Waiting for services to start..."
+          sleep 60
+          
+          # Show running containers
+          echo "Running containers:"
+          docker-compose -f docker-compose.yml ps
+          
+          # Check service health
+          echo "Checking service health..."
+          for i in {1..30}; do
+            if curl -f http://localhost:8000/health 2>/dev/null; then
+              echo "✓ API Gateway is healthy"
+              break
+            fi
+            echo "Waiting for API Gateway... ($i/30)"
+            sleep 10
+          done
+          
+          for i in {1..30}; do
+            if curl -f http://localhost:3000 2>/dev/null; then
+              echo "✓ Studio is healthy"
+              break
+            fi
+            echo "Waiting for Studio... ($i/30)"
+            sleep 10
+          done
+          
+          echo "Supabase deployment completed successfully!"
+          echo "Studio URL: http://$(curl -s ifconfig.me):3000"
+          echo "API URL: http://$(curl -s ifconfig.me):8000"
+          EOF
+          
+          chmod +x deployment/deploy-supabase.sh
+          
+          # Create backup script
+          cat > deployment/backup-supabase.sh << 'EOF'
+          #!/bin/bash
+          set -e
+          
+          BACKUP_DIR="backups/$(date +%Y%m%d_%H%M%S)"
+          mkdir -p $BACKUP_DIR
+          
+          echo "Creating Supabase backup..."
+          
+          # Backup database
+          docker-compose exec -T db pg_dump -U postgres postgres > $BACKUP_DIR/database.sql
+          
+          # Backup storage
+          tar -czf $BACKUP_DIR/storage.tar.gz volumes/storage/
+          
+          # Backup configuration
+          cp docker-compose.yml $BACKUP_DIR/
+          cp .env $BACKUP_DIR/env.backup
+          
+          echo "Backup completed: $BACKUP_DIR"
+          EOF
+          
+          chmod +x deployment/backup-supabase.sh
+
+      - name: Transfer files to GCP VM
+        run: |
+          echo "Transferring Supabase deployment files to GCP VM..."
+          
+          # Use gcloud to copy files to VM
+          gcloud compute scp --recurse \
+            deployment/ \
+            ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_INSTANCE_NAME }}:/home/${{ secrets.GCP_VM_USER }}/supabase/ \
+            --zone=${{ secrets.GCP_VM_ZONE }} \
+            --quiet
+          
+          echo "Files transferred successfully!"
+
+      - name: Install Docker and dependencies on GCP VM
+        run: |
+          echo "Installing Docker and dependencies..."
+          gcloud compute ssh ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_INSTANCE_NAME }} \
+            --zone=${{ secrets.GCP_VM_ZONE }} \
+            --command="
+              # Update system
+              sudo apt-get update
+              
+              # Install Docker if not already installed
+              if ! command -v docker &> /dev/null; then
+                echo 'Installing Docker...'
+                curl -fsSL https://get.docker.com -o get-docker.sh
+                sudo sh get-docker.sh
+                sudo usermod -aG docker \$USER
+              fi
+              
+              # Install Docker Compose if not already installed
+              if ! command -v docker-compose &> /dev/null; then
+                echo 'Installing Docker Compose...'
+                sudo curl -L \"https://github.com/docker/compose/releases/latest/download/docker-compose-\$(uname -s)-\$(uname -m)\" -o /usr/local/bin/docker-compose
+                sudo chmod +x /usr/local/bin/docker-compose
+              fi
+              
+              # Install Google Cloud SDK if not already installed
+              if ! command -v gcloud &> /dev/null; then
+                echo 'Installing Google Cloud SDK...'
+                curl https://sdk.cloud.google.com | bash
+                source ~/.bashrc
+              fi
+              
+              echo 'Dependencies installation completed!'
+            " \
+            --quiet
+
+      - name: Deploy Supabase on GCP VM
+        run: |
+          echo "Deploying Supabase to GCP VM..."
+          gcloud compute ssh ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_INSTANCE_NAME }} \
+            --zone=${{ secrets.GCP_VM_ZONE }} \
+            --command="
+              cd /home/${{ secrets.GCP_VM_USER }}/supabase/
+              echo 'Current directory contents:'
+              ls -la
+              echo 'Starting deployment...'
+              chmod +x deploy-supabase.sh
+              ./deploy-supabase.sh
+            " \
+            --quiet
+
+      - name: Configure firewall rules
+        run: |
+          echo "Configuring firewall rules for Supabase..."
+          
+          # Allow Supabase ports
+          gcloud compute firewall-rules create allow-supabase-studio \
+            --allow tcp:3000 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow Supabase Studio" \
+            --project=${{ secrets.GCP_PROJECT_ID }} || echo "Rule may already exist"
+          
+          gcloud compute firewall-rules create allow-supabase-api \
+            --allow tcp:8000 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow Supabase API" \
+            --project=${{ secrets.GCP_PROJECT_ID }} || echo "Rule may already exist"
+          
+          gcloud compute firewall-rules create allow-supabase-db \
+            --allow tcp:5432 \
+            --source-ranges 0.0.0.0/0 \
+            --description "Allow Supabase Database" \
+            --project=${{ secrets.GCP_PROJECT_ID }} || echo "Rule may already exist"
+          
+          echo "Firewall rules configured"
+
+  health-check-supabase:
+    runs-on: self-hosted
+    needs: deploy-supabase-to-gcp
+    if: github.ref == 'refs/heads/infra-supabase' && vars.DEPLOY_TO_GCP == 'true'
+    steps:
+      - name: Set up Google Cloud CLI
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          service_account_key: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Perform Supabase health checks
+        run: |
+          # Get VM external IP
+          EXTERNAL_IP=$(gcloud compute instances describe ${{ secrets.GCP_VM_INSTANCE_NAME }} \
+            --zone=${{ secrets.GCP_VM_ZONE }} \
+            --format="get(networkInterfaces[0].accessConfigs[0].natIP)")
+          
+          echo "Performing Supabase health checks on ${EXTERNAL_IP}"
+          
+          # Wait for services to be fully ready
+          sleep 120
+          
+          # Health check for Supabase Studio (port 3000)
+          echo "Checking Supabase Studio..."
+          for i in {1..10}; do
+            if curl -f "http://${EXTERNAL_IP}:3000" --max-time 10; then
+              echo "✓ Supabase Studio is healthy"
+              break
+            fi
+            echo "Attempt $i/10 - Studio not ready yet..."
+            sleep 30
+          done
+          
+          # Health check for API Gateway (port 8000)
+          echo "Checking Supabase API Gateway..."
+          for i in {1..10}; do
+            if curl -f "http://${EXTERNAL_IP}:8000/health" --max-time 10; then
+              echo "✓ Supabase API Gateway is healthy"
+              break
+            fi
+            echo "Attempt $i/10 - API Gateway not ready yet..."
+            sleep 30
+          done
+          
+          # Check database connectivity
+          echo "Checking database connectivity..."
+          gcloud compute ssh ${{ secrets.GCP_VM_USER }}@${{ secrets.GCP_VM_INSTANCE_NAME }} \
+            --zone=${{ secrets.GCP_VM_ZONE }} \
+            --command="docker-compose -f /home/${{ secrets.GCP_VM_USER }}/supabase/docker-compose.yml exec -T db pg_isready -U postgres" \
+            --quiet && echo "✓ Database is ready" || echo "✗ Database check failed"
+          
+          echo "=== Supabase Deployment Summary ==="
+          echo "Studio URL: http://${EXTERNAL_IP}:3000"
+          echo "API URL: http://${EXTERNAL_IP}:8000"
+          echo "Database: ${EXTERNAL_IP}:5432"
+          echo "==================================="
+
+  cleanup-supabase:
+    runs-on: self-hosted
+    needs: [health-check-supabase]
+    if: always() && github.ref == 'refs/heads/infra-supabase'
+    steps:
+      - name: Cleanup artifacts
+        run: |
+          echo "Supabase deployment pipeline completed."
+          echo "Artifacts will be automatically cleaned up by GitHub."
